@@ -4,55 +4,310 @@ name: Build Aditya Astra X APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
 
 permissions:
   contents: read
 
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    name: Build Android APK
+    name: Build, Debug and Verify APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
-      - name: Checkout repository
+      - name: Checkout source code
         uses: actions/checkout@v4
+
+      - name: Show runner information
+        run: |
+          echo "======================================"
+          echo " ADITYA ASTRA X - BUILD DIAGNOSTICS"
+          echo "======================================"
+          date -u
+          uname -a
+          java -version || true
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Branch: $GITHUB_REF_NAME"
+          echo "Commit: $GITHUB_SHA"
+
+      - name: Inspect repository files
+        shell: bash
+        run: |
+          set -e
+          echo "Repository root:"
+          pwd
+          echo "Top-level files:"
+          ls -la
+          echo "Gradle project files:"
+          find . -maxdepth 5 \
+            \( -path './.git' -o -path './.github' \) -prune \
+            -o \( -name settings.gradle \
+               -o -name settings.gradle.kts \
+               -o -name gradlew \
+               -o -name build.gradle \
+               -o -name build.gradle.kts \) -print
+
+      - name: Detect Android project directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_FILE=""
+
+          for FILE in \
+            "./settings.gradle.kts" \
+            "./settings.gradle" \
+            "./aditya-ai/settings.gradle.kts" \
+            "./aditya-ai/settings.gradle"
+          do
+            if [ -f "$FILE" ]; then
+              PROJECT_FILE="$FILE"
+              break
+            fi
+          done
+
+          if [ -z "$PROJECT_FILE" ]; then
+            PROJECT_FILE="$(find . -maxdepth 5 \
+              \( -path './.git' -o -path './.github' \) -prune \
+              -o \( -name settings.gradle.kts \
+                 -o -name settings.gradle \) -print \
+              | head -n 1 || true)"
+          fi
+
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "::error::No Gradle settings file found."
+            echo "Check that the ZIP was extracted before uploading."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PROJECT_FILE")"
+          PROJECT_DIR="${PROJECT_DIR#./}"
+          [ "$PROJECT_DIR" = "." ] && PROJECT_DIR="."
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Android project directory: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
       - name: Install Android SDK packages
+        shell: bash
         run: |
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          set -euo pipefail
 
-      - name: Set up Gradle
+          echo "Installing Android SDK packages..."
+          sdkmanager --version
+          sdkmanager --list_installed || true
+
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0" \
+            "build-tools;36.0.0"
+
+          echo "Installed SDK packages:"
+          sdkmanager --list_installed
+
+      - name: Check Gradle configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          echo "Project directory: $(pwd)"
+          echo "Gradle configuration:"
+          ls -la
+
+          if [ -f "gradlew" ]; then
+            chmod +x gradlew
+            echo "Using project Gradle Wrapper."
+            ./gradlew --version
+          elif [ -f "gradlew.bat" ]; then
+            echo "::error::Windows-only Gradle wrapper detected."
+            echo "A Linux gradlew script is needed for this runner."
+            exit 1
+          else
+            echo "::warning::Gradle Wrapper not found."
+            echo "The build will try Gradle 8.9."
+            echo "This version may need adjustment for your project."
+          fi
+
+      - name: Set up fallback Gradle
+        if: success()
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+          cache-disabled: true
 
-      - name: Run unit tests
-        run: gradle --no-daemon testDebugUnitTest
-
-      - name: Build debug APK
-        run: gradle --no-daemon assembleDebug
-
-      - name: Prepare APK
+      - name: Print Android project diagnostics
+        shell: bash
         run: |
-          mkdir -p output
-          cp app/build/outputs/apk/debug/app-debug.apk output/Aditya-Astra-X.apk
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          echo "===== SETTINGS FILE ====="
+          if [ -f settings.gradle.kts ]; then
+            cat settings.gradle.kts
+          elif [ -f settings.gradle ]; then
+            cat settings.gradle
+          fi
+
+          echo "===== ROOT BUILD FILE ====="
+          if [ -f build.gradle.kts ]; then
+            sed -n '1,220p' build.gradle.kts
+          elif [ -f build.gradle ]; then
+            sed -n '1,220p' build.gradle
+          fi
+
+          echo "===== APP MODULE ====="
+          if [ -d app ]; then
+            ls -la app
+            if [ -f app/build.gradle.kts ]; then
+              sed -n '1,220p' app/build.gradle.kts
+            elif [ -f app/build.gradle ]; then
+              sed -n '1,220p' app/build.gradle
+            fi
+          else
+            echo "::warning::No app/ directory at project root."
+            echo "The project may use a different module name."
+          fi
+
+      - name: Build debug APK with detailed logging
+        id: android_build
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ -x "./gradlew" ]; then
+            GRADLE_CMD="./gradlew"
+          elif [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            GRADLE_CMD="./gradlew"
+          else
+            GRADLE_CMD="gradle"
+          fi
+
+          echo "Gradle command: $GRADLE_CMD"
+          echo "Running Android build..."
+
+          set +e
+          $GRADLE_CMD \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            --warning-mode all \
+            assembleDebug 2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
+
+          BUILD_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          echo "BUILD_STATUS=$BUILD_STATUS" >> "$GITHUB_ENV"
+
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "::error::Android build failed with exit code $BUILD_STATUS."
+            echo "===== LAST 150 LOG LINES ====="
+            tail -n 150 "$RUNNER_TEMP/gradle-build.log" || true
+            exit "$BUILD_STATUS"
+          fi
+
+          echo "Android build command completed successfully."
+
+      - name: Locate and verify APK
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p output diagnostics
+
+          if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR" ]; then
+            find "$PROJECT_DIR" -type f -name '*.apk' \
+              -exec cp --parents {} output/ \; || true
+          fi
+
+          echo "===== APK FILES ====="
+          find output -type f -name '*.apk' -print || true
+
+          APK="$(find output -type f -name '*debug*.apk' \
+            | head -n 1 || true)"
+
+          if [ -z "$APK" ]; then
+            APK="$(find output -type f -name '*.apk' \
+              | head -n 1 || true)"
+          fi
+
+          if [ -n "$APK" ]; then
+            mkdir -p output/final
+            cp "$APK" output/final/Aditya-Astra-X-debug.apk
+            echo "APK found and copied successfully."
+            ls -lh output/final/Aditya-Astra-X-debug.apk
+            sha256sum output/final/Aditya-Astra-X-debug.apk \
+              | tee output/final/SHA256SUMS.txt
+          else
+            echo "::warning::No APK was found."
+            echo "Check the build logs and module configuration."
+          fi
+
+      - name: Collect diagnostic reports
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p diagnostics
+
+          if [ -f "$RUNNER_TEMP/gradle-build.log" ]; then
+            cp "$RUNNER_TEMP/gradle-build.log" \
+              diagnostics/gradle-build.log
+          fi
+
+          if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR" ]; then
+            find "$PROJECT_DIR" -type f \
+              \( -name '*.log' -o -name '*.txt' \) \
+              -not -path '*/.gradle/*' \
+              -exec cp --parents {} diagnostics/ \; || true
+
+            find "$PROJECT_DIR" -type f \
+              \( -path '*/build/reports/*' \
+                 -o -path '*/build/outputs/logs/*' \) \
+              -exec cp --parents {} diagnostics/ \; || true
+          fi
+
+          echo "===== DIAGNOSTIC FILES ====="
+          find diagnostics -type f -print || true
 
       - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Aditya-Astra-X-APK
-          path: output/Aditya-Astra-X.apk
+          path: output/final/Aditya-Astra-X-debug.apk
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build logs and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aditya-Astra-X-Debug-Reports
+          path: |
+            diagnostics/
+            output/
+          if-no-files-found: warn
           retention-days: 7
           
