@@ -32,7 +32,6 @@ jobs:
           echo "Repository: $GITHUB_REPOSITORY"
           echo "Branch: $GITHUB_REF_NAME"
           echo "Commit: $GITHUB_SHA"
-          date -u
           java -version || true
           echo "Runner workspace: $GITHUB_WORKSPACE"
           df -h
@@ -97,7 +96,7 @@ jobs:
 
           if [ -z "$FOUND" ]; then
             echo "::error::No Gradle settings file found."
-            echo "The uploaded ZIP may not contain an Android Gradle project."
+            echo "The ZIP must contain a real Android Gradle project."
             echo "Expected settings.gradle or settings.gradle.kts."
             echo "Repository root:"
             ls -la "$ROOT"
@@ -121,17 +120,20 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
 
       - name: Install Android SDK platform
         shell: bash
         run: |
           set -euo pipefail
+
           sdkmanager --version
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-35"
-          yes | sdkmanager --licenses >/dev/null || true
+
           sdkmanager --list_installed
 
       - name: Inspect Gradle configuration
@@ -177,7 +179,6 @@ jobs:
           else
             echo "::warning::Gradle Wrapper missing."
             echo "Using installed Gradle fallback."
-            echo "The required Gradle version may differ by project."
           fi
 
       - name: Set up fallback Gradle
@@ -220,7 +221,6 @@ jobs:
 
           if [ "$STATUS" -ne 0 ]; then
             echo "::error::Gradle build failed."
-            echo "=== Last 150 lines ==="
             tail -n 150 "$RUNNER_TEMP/aditya-reports/build.log"
             exit "$STATUS"
           fi
@@ -236,7 +236,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/output"
 
-          if [ -d "$PROJECT_DIR" ]; then
+          if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR" ]; then
             find "$PROJECT_DIR" -type f -name '*.apk' \
               -exec cp {} "$GITHUB_WORKSPACE/output/" \; || true
           fi
